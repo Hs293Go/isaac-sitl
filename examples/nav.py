@@ -20,6 +20,7 @@ perfect feedback).
 """
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import cast
@@ -46,6 +47,33 @@ parser.add_argument(
 parser.add_argument(
     "--gust", type=float, default=0.0, help="OU gust std [m/s] (tau 1 s) atop --wind"
 )
+parser.add_argument(
+    "--force",
+    type=float,
+    nargs=3,
+    default=(0.0, 0.0, 0.0),
+    metavar=("FX", "FY", "FZ"),
+    help="constant ENU force bias [N] (e.g. 0 0 -0.981 = a 100 g payload pickup)",
+)
+parser.add_argument(
+    "--torque",
+    type=float,
+    nargs=3,
+    default=(0.0, 0.0, 0.0),
+    metavar=("TX", "TY", "TZ"),
+    help="constant body-FLU torque bias [N.m]",
+)
+parser.add_argument(
+    "--onset", type=float, default=0.0, help="disturbance onset [s] (0 = from spawn)"
+)
+parser.add_argument("--ramp", type=float, default=0.0, help="onset ramp duration [s]")
+parser.add_argument("--seed", type=int, default=0, help="gust RNG seed (recorded)")
+parser.add_argument(
+    "--mass-scale",
+    type=float,
+    default=1.0,
+    help="PLANT mass scale; the controller keeps the nominal (parametric mismatch)",
+)
 parser.add_argument("--out", default=None, help="verdict mirror (console-only default)")
 parser.add_argument("--dump", default=None, help="save ts/ref/true/err to .npz")
 AppLauncher.add_app_launcher_args(parser)
@@ -59,6 +87,7 @@ import torch  # noqa: E402
 
 from isaacsitl import (  # noqa: E402
     ClassicalControllerBackend,
+    DisturbanceCfg,
     Eskf,
     EskfConfig,
     Imu,
@@ -71,13 +100,10 @@ from isaacsitl import (  # noqa: E402
     PinvAllocator,
     State,
     WindCfg,
-    WindField,
-    so3,
 )
 from isaacsitl.geomag import field_ned_gauss  # noqa: E402
 from isaacsitl.gnc.pid_controller import PIDController, PIDControllerCfg  # noqa: E402
 from isaacsitl.gnc.trajectory import circle, figure_8, saddle  # noqa: E402
-from isaacsitl.quadrotor import BodyDrag  # noqa: E402
 from isaacsitl.sim import DroneSim  # noqa: E402
 
 _DT = 0.01
@@ -194,6 +220,7 @@ try:
         usd=args.usd,
         spawn=spawn,
         spawn_vel=spawn_vel,
+        mass_scale=args.mass_scale,
     )
     af = dsim.airframe
     max_thrust = dsim.max_thrust  # per-rotor cap [N]; motors saturate
@@ -218,20 +245,32 @@ try:
         position=spawn,
     ).to(args.device)
 
-    # Optional wind: a steady + OU-gust field, felt through the OQCRL rotor drag on
-    # the AIR-relative velocity (a force model; off by default, so the still-air
-    # baseline stays byte-identical to the documented numbers).
-    wind = drag = None
-    if args.wind > 0.0 or args.gust > 0.0:
-        wind = WindField(
-            WindCfg(steady=(args.wind, 0.0, 0.0), gust_std=args.gust),
-            dsim.num_envs,
-            args.device,
+    # Optional disturbance (off by default -- the still-air baseline stays
+    # byte-identical to the documented numbers): wind felt through the OQCRL rotor
+    # drag on the AIR-relative velocity, plus constant force/torque biases and the
+    # plant-side mass mismatch, all onset-gated and seed-deterministic
+    # (isaacsitl.disturbance -- the L1-validation experiment shape).
+    dist_cfg = None
+    if args.wind > 0.0 or args.gust > 0.0 or any(args.force) or any(args.torque):
+        drag_linear = wind_cfg = None
+        if args.wind > 0.0 or args.gust > 0.0:
+            w_sum_hover = 2.0 * math.sqrt(_G / _KW)  # sum of the 4 hover rotor speeds
+            drag_linear = (  # OQCRL rotor drag; aero scales with the DRONE, so nominal
+                dsim.mass_nominal * _KX * w_sum_hover,
+                dsim.mass_nominal * _KY * w_sum_hover,
+                0.0,
+            )
+            wind_cfg = WindCfg(steady=(args.wind, 0.0, 0.0), gust_std=args.gust)
+        dist_cfg = DisturbanceCfg(
+            wind=wind_cfg,
+            drag_linear=drag_linear,
+            force_enu=tuple(args.force),
+            torque_flu=tuple(args.torque),
+            t_on=args.onset,
+            ramp=args.ramp,
+            seed=args.seed,
         )
-        w_sum_hover = 2.0 * math.sqrt(_G / _KW)  # sum of the 4 hover rotor speeds
-        drag = BodyDrag(
-            linear=(dsim.mass * _KX * w_sum_hover, dsim.mass * _KY * w_sum_hover, 0.0)
-        ).to(args.device)
+        dsim.set_disturbance(dist_cfg)
 
     truth = dsim.state()
     est = (
@@ -241,14 +280,12 @@ try:
     )
     inertia_str = [round(x, 6) for x in dsim.inertia.tolist()]
     fb = "ESKF estimate (mag=on)" if est is not None else "ground truth"
-    lines.append(
-        f"booted: mass={dsim.mass:.4f} kg, inertia_diag={inertia_str} feedback={fb}"
-    )
-    if wind is not None:
-        lines.append(
-            f"wind: steady {args.wind:.1f} m/s +x, gusts {args.gust:.1f} m/s "
-            "(OQCRL 5-inch rotor drag at hover)"
-        )
+    mass_str = f"mass={dsim.mass:.4f} kg"
+    if args.mass_scale != 1.0:  # noqa: RUF069 -- exact sentinel default
+        mass_str += f" (controller told nominal {dsim.mass_nominal:.4f} kg)"
+    lines.append(f"booted: {mass_str}, inertia_diag={inertia_str} feedback={fb}")
+    if dist_cfg is not None:
+        lines.append("disturbance: " + json.dumps(dist_cfg.provenance()))
 
     # Track the trajectory: set the per-step reference (pos + vel/accel feed-forward),
     # estimate, control, and log the TRUE tracking error ||p - r(t)|| (on truth).
@@ -266,11 +303,7 @@ try:
         act = ctl.actuation()
         act.rotor_thrust = act.rotor_thrust.clamp(max=max_thrust)  # motors saturate
         sat_steps += int(bool((act.rotor_thrust >= max_thrust - 1e-6).any()))
-        w_vel = wind.step(_DT) if wind is not None else None
-        if drag is not None and w_vel is not None:
-            v_rel = truth.linear_velocity - w_vel  # drag opposes the AIR-relative v
-            vel_body = so3.quat_rotate(so3.quat_conjugate(truth.attitude), v_rel)
-            act.body_force = drag.force(vel_body)
+        # (any configured disturbance is applied inside dsim.step)
 
         err[k] = torch.linalg.norm(truth.position[0] - ref_pos[k])
         true_pos[k] = truth.position[0]
@@ -297,9 +330,17 @@ try:
         f"(horizontal {exy * 100:.1f} cm, vertical {ez * 100:.1f} cm); "
         f"thrust saturation {100.0 * sat_steps / flown:.1f}% of steps"
     )
+    k_on = int(args.onset / _DT)
+    if 0 < k_on < flown:  # transient visibility: split the metric at the onset
+        pre = float(np.sqrt((e[:k_on] ** 2).mean()))
+        post = float(np.sqrt((e[k_on:] ** 2).mean()))
+        lines.append(
+            f"onset split @ {args.onset:.1f}s: pre {pre * 100:.1f} cm RMS | "
+            f"post {post * 100:.1f} cm RMS, post peak {e[k_on:].max() * 100:.1f} cm"
+        )
     if broke is not None:
         lines.append(f"BROKE at t={broke[0] * _DT:.2f} s: {broke[1]}")
-    print("\n".join(f"[nav] {ln}" for ln in lines[-3:]), flush=True)
+    print("\n".join(f"[nav] {ln}" for ln in lines[-4:]), flush=True)
     if args.dump:
         np.savez(
             args.dump,
