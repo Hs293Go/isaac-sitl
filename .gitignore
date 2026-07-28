@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# hs293math golden-record download cache (test_so3_goldens)
+tests/.golden_cache/
+
+# Rollout dumps / verdict mirrors
+out/
+*.npz

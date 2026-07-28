@@ -1,0 +1,12 @@
+# PX4 none_iris (PegasusSim iris USD). Geometry = the iris USD's MEASURED rotor-link (x, y)
+# offsets in USD rotor0-3 order (front-right, back-left, front-left, back-right = PX4
+# CA_ROTOR order -> motor_order identity). Native iris mass/inertia come from the USD (no
+# override); force-at-links forms roll/pitch from these link positions.
+usd: iris.usd # vendored in isaacsitl/assets (from PegasusSimulator, BSD-3; see NOTICE.md)
+rotor_x: [0.1376, -0.125, 0.1383, -0.1245] # m, FLU forward
+rotor_y: [-0.2067, 0.2187, 0.2032, -0.222] # m, FLU left
+yaw_signs: [1, 1, -1, -1] # PX4 CA_ROTOR KM sign (diagonal-pair spin)
+kappa: 0.05 # = PX4 CA_ROTOR KM magnitude
+motor:
+  kind: instant
+  twr: 2.0 # hover at PX4 throttle ~0.5 -> max_thrust = 2 * mass * g / 4 (from the live mass)

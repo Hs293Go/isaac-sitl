@@ -1,0 +1,11 @@
+# SourceOne 5-inch racer -- geometry from the isaac-drone-racing CAD (betaflight motor
+# layout). The RL racing airframe. rotor_x/y are the CAD arm offsets; the racer USD's
+# rotor links sit at the same positions (the rotor-order assert checks it on boot).
+usd: racer.usd # vendored in isaacsitl/assets (from isaac-drone-racing; see NOTICE.md)
+rotor_x: [-0.1008, 0.1008, -0.1008, 0.1008] # m, FLU forward
+rotor_y: [-0.0766, -0.0766, 0.0766, 0.0766] # m, FLU left
+yaw_signs: [-1, 1, 1, -1]
+kappa: 0.0157 # cq/ct
+motor:
+  kind: instant
+  max_thrust: 4.6 # per-rotor [N] -> ~4:1 TWR at 0.472 kg
