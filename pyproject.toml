@@ -1,0 +1,144 @@
+[project]
+name = "isaac-sitl"
+version = "0.1.0"
+description = "A single-vehicle physics SITL simulator on Isaac Lab: articulation plant, autopilot-grade sensors, and a classical GNC reference stack."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "H S Helson Go", email = "hellston20a@gmail.com" }]
+requires-python = "==3.11.*"  # Isaac Sim 5.1 / Isaac Lab 2.3.x is cp311; match the validated stack
+dependencies = [
+    "minsnap-trajectories>=0.2.2",
+    "numpy", # unpinned: the isaaclab group (Isaac Sim 5.1) needs numpy<2 — let it govern
+    "omegaconf>=2.3.1",
+    "scipy",
+    "torch",
+]
+
+[dependency-groups]
+# safetensors: reads the hs293math golden record (tests/test_so3_goldens.py) — the
+# cross-repo rotation parity anchor; never needed at run time.
+dev = ["pytest>=8", "safetensors>=0.4"]
+# The Isaac-side plant (`isaacsitl.sim`), pinned to the validated stack (Isaac Sim 5.1 /
+# Isaac Lab 2.3.x, cp311). Opt-in so the torch-only surface imports without a sim boot:
+#   uv sync --group isaaclab
+isaaclab = [
+    "isaacsim[all,extscache]==5.1.0.0",
+    "isaaclab[all]==2.3.2.post1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Dist name (isaac-sitl) differs from the import package (isaacsitl); name it explicitly.
+[tool.hatch.build.targets.wheel]
+packages = ["src/isaacsitl"]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+constraint-dependencies = ["lxml<7"]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+preview = true
+fix = true
+unsafe-fixes = true
+extend-exclude = [".venv", "venv", "build", "dist"]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "B",
+  "I",
+  "N",
+  "D",
+  "UP",
+  "S",
+  "SIM",
+  "C4",
+  "PTH",
+  "PIE",
+  "PERF",
+  "ISC",
+  "ICN",
+  "ARG",
+  "YTT",
+  "SLF",
+  "TRY",
+  "EXE",
+  "PL",
+  "RUF",
+]
+ignore = [
+  "COM",
+  "E111",
+  "E114",
+  "E117",
+  "W191",
+  "D203",
+  "D213",
+  "D401",
+  "ANN",
+  "C90",
+  "T20",
+  "ERA",
+  "TRY003",
+  "PLR2004",
+  "PLR0904",
+  "PLR0911",
+  "PLR0912",
+  "PLR0913",
+  "PLR0914",
+  "PLR0915",
+  "PLR0916",
+  "PLR0917",
+  # Intentional in this Isaac Sim package (one-offs use targeted # noqa instead):
+  "N802",     # math-symbol function names (e.g. motor_W) read better capitalized
+  "N806",     # math-symbol locals (rotation R, motor speed W) mirror the equations
+  "PLC0415",  # isaacsim imports MUST follow SimulationApp() boot -> deliberate in-function imports
+  "ARG002",   # base/override signature parity
+  "SLF001",   # deliberate within-package access to _members
+  "PLR6301",  # lifecycle hooks intentionally take no self state
+]
+fixable = ["ALL"]
+unfixable = ["S", "PL"]
+per-file-ignores = { "tests/**" = [
+  "D",
+  "ANN",
+  "S101",
+  "T20",
+  "SLF001",
+  "PLC2701",
+], "**/__init__.py" = [
+  "F401",
+  "F403",
+  "D104",
+] }
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 100
