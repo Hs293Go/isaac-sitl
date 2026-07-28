@@ -45,6 +45,12 @@ url = "https://pypi.nvidia.com"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Bare `pytest` runs the fast, isaac-free unit suite; the sim tier is opt-in:
+#   pytest -m integration   end-to-end through a live Isaac Sim (GPU + isaaclab group)
+addopts = "-m 'not integration'"
+markers = [
+  "integration: end-to-end through a live Isaac Sim; needs a GPU + the isaaclab group",
+]
 
 [tool.ruff]
 target-version = "py311"

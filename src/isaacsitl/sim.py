@@ -22,6 +22,7 @@ import torch
 from isaacsitl import conversions, so3
 from isaacsitl.actuation import Actuation
 from isaacsitl.airframe import AirframeCfg, load_airframe, resolve_usd
+from isaacsitl.disturbance import Disturbance, DisturbanceCfg
 from isaacsitl.gnc.controller import InertialProperties
 from isaacsitl.state import State
 
@@ -82,6 +83,8 @@ class ArticulationVehicle:
         if rotor_xy is not None and self._link_ids is not None:
             self._assert_rotor_order(rotor_xy)
         self._prev_vel = torch.zeros_like(articulation.data.root_lin_vel_w)
+        self._ext_force_enu: torch.Tensor | None = None
+        self._ext_torque_flu: torch.Tensor | None = None
 
     def read_state(self) -> State:
         """Read the batched ENU-FLU `State` (PURE; call `commit_step` 1x/step).
@@ -108,6 +111,25 @@ class ArticulationVehicle:
         """Latch current velocity as the next accel baseline (pre-physics, 1x/step)."""
         self._prev_vel = self._art.data.root_lin_vel_w.clone()
 
+    def set_external_wrench(
+        self,
+        force_enu: torch.Tensor | None = None,
+        torque_flu: torch.Tensor | None = None,
+    ) -> None:
+        """Latch an ENVIRONMENTAL wrench on the base body, independent of actuation.
+
+        The disturbance seam: persists until re-set (call each step for a
+        time-varying disturbance; `None` clears). `force_enu` is (N, 3) ENU
+        WORLD [N], rotated into body FLU at apply time with the attitude current
+        then; `torque_flu` is (N, 3) body FLU [N.m]. Composed into the base-body
+        slot of the force-at-links write AFTER the commanded body force/torque —
+        a separate composer call on the same body would OVERWRITE, not compose
+        (the disjoint-slot rule), so this rides `apply_actuation`'s
+        `rotor_thrust` path.
+        """
+        self._ext_force_enu = force_enu
+        self._ext_torque_flu = torque_flu
+
     def apply_actuation(self, actuation: Actuation) -> None:
         """Apply the rotor forces/wrench and any joint efforts/positions."""
         if actuation.rotor_thrust is not None and self._link_ids is not None:
@@ -123,6 +145,13 @@ class ArticulationVehicle:
                 forces[..., n, :] = actuation.body_force  # COM body force (drag etc.)
             if actuation.body_torque is not None:
                 torques[..., n, :] = actuation.body_torque  # yaw couple on the body
+            if self._ext_force_enu is not None:
+                q = conversions.quat_wxyz_to_xyzw(self._art.data.root_quat_w)
+                forces[..., n, :] += so3.quat_rotate(
+                    so3.quat_conjugate(q), self._ext_force_enu
+                )
+            if self._ext_torque_flu is not None:
+                torques[..., n, :] += self._ext_torque_flu
             self._art.permanent_wrench_composer.set_forces_and_torques(
                 forces, torques, body_ids=self._link_ids
             )
@@ -202,6 +231,8 @@ class DroneSim:
         spawn_vel: tuple[float, float, float] = (0.0, 0.0, 0.0),
         physx: PhysxCfg | None = None,
         prim_path: str = "/World/Robot",
+        mass_scale: float = 1.0,
+        disturbance: DisturbanceCfg | None = None,
     ):
         """Build sim context + scene + vehicle from an airframe spec.
 
@@ -216,6 +247,12 @@ class DroneSim:
             physx: optional PhysX overrides; the default shrinks the GPU contact
                 buffers for a single vehicle (the defaults reserve ~GBs).
             prim_path: stage path for the spawned robot.
+            mass_scale: PLANT-side mass scale (parametric mismatch): PhysX
+                masses are scaled at boot while `mass_nominal`/`inertial` keep
+                the nominal — a controller reading them flies believing the
+                spec while the plant weighs the truth (`mass`).
+            disturbance: optional deterministic external-wrench spec, applied
+                automatically each `step` (see `isaacsitl.disturbance`).
         """
         self.airframe = (
             load_airframe(airframe) if isinstance(airframe, str) else airframe
@@ -255,19 +292,29 @@ class DroneSim:
         self.robot.write_root_velocity_to_sim(root_vel)
         # Airframe FACTS read live from PhysX (the USD is the authority): total mass
         # and the base body's principal inertia feed the inertia-aware controllers.
-        masses = self.robot.root_physx_view.get_masses()[0]
-        self.mass = float(masses.sum())
+        masses = self.robot.root_physx_view.get_masses()
+        self.mass_nominal = float(masses[0].sum())
+        if mass_scale != 1.0:  # noqa: RUF069 -- exact sentinel default, not arithmetic
+            # Parametric mismatch: the PLANT gets the scaled truth; the
+            # controller-facing numbers below stay nominal.
+            self.robot.root_physx_view.set_masses(masses * mass_scale, torch.arange(n))
+            masses = self.robot.root_physx_view.get_masses()
+        self.mass = float(masses[0].sum())
         bid = int(self.robot.find_bodies("body")[0][0])
         inertia_full = self.robot.root_physx_view.get_inertias()[0, bid].reshape(3, 3)
         self.inertia = torch.diagonal(inertia_full).to(device).clamp_min(1e-6)
+        # Controller-facing NOMINAL properties; the plant's truth is `mass`.
         self.inertial = InertialProperties(
-            mass=torch.as_tensor(self.mass, device=device), inertia=self.inertia
+            mass=torch.as_tensor(self.mass_nominal, device=device),
+            inertia=self.inertia,
         )
         m = self.airframe.motor
         if m.max_thrust is not None:
             self.max_thrust = float(m.max_thrust)
         elif m.twr is not None:
-            self.max_thrust = m.twr * self.mass * _GRAVITY / len(self.airframe.rotor_x)
+            self.max_thrust = (
+                m.twr * self.mass_nominal * _GRAVITY / len(self.airframe.rotor_x)
+            )
         else:
             raise ValueError("airframe motor spec needs `max_thrust` or `twr`")
         rotor_xy = (
@@ -282,6 +329,23 @@ class DroneSim:
             rotor_xy=rotor_xy,
         )
         self.vehicle.commit_step()
+        self._t = 0.0
+        self._disturbance: Disturbance | None = None
+        if disturbance is not None:
+            self.set_disturbance(disturbance)
+
+    def set_disturbance(self, cfg: DisturbanceCfg | None) -> None:
+        """Install (or clear) the deterministic disturbance for this flight.
+
+        Call before flying: the runtime is built for this sim's env count,
+        device, and dt, and `step` applies its wrench every physics step. `None`
+        (or an all-defaults cfg) restores the exact clean path.
+        """
+        if cfg is None or not cfg.active():
+            self._disturbance = None
+            self.vehicle.set_external_wrench(None, None)
+            return
+        self._disturbance = Disturbance(cfg, self.num_envs, self.device, self.dt)
 
     def state(self) -> State:
         """The current batched `State` (pure read)."""
@@ -314,6 +378,7 @@ class DroneSim:
             self.robot.write_root_velocity_to_sim(vel)
         self.vehicle.reset()
         self.vehicle.commit_step()
+        self._t = 0.0  # re-arms the disturbance onset for the new flight
         return self.vehicle.read_state()
 
     def step(self, action: Actuation | torch.Tensor) -> State:
@@ -325,6 +390,9 @@ class DroneSim:
                 controller's output, applied as given: rotor thrusts + yaw couple +
                 body forces).
         """
+        if self._disturbance is not None:
+            f, tau = self._disturbance.wrench(self._t, self.vehicle.read_state())
+            self.vehicle.set_external_wrench(f, tau)
         if not isinstance(action, Actuation):
             thrust = torch.as_tensor(
                 action, dtype=torch.float32, device=self.device
@@ -335,4 +403,5 @@ class DroneSim:
         self.robot.write_data_to_sim()
         self.sim.step()
         self.robot.update(self.dt)
+        self._t += self.dt
         return self.vehicle.read_state()
