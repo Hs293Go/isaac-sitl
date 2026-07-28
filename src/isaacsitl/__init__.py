@@ -12,6 +12,7 @@ importable only AFTER `isaacsitl.app.launch()` (or your own AppLauncher).
 from isaacsitl import conversions, so3
 from isaacsitl.actuation import Actuation
 from isaacsitl.airframe import AirframeCfg, build_quadrotor, load_airframe
+from isaacsitl.disturbance import Disturbance, DisturbanceCfg
 from isaacsitl.gnc.control import ClassicalControllerBackend
 from isaacsitl.gnc.controller import (
     InertialProperties,
@@ -45,6 +46,8 @@ __all__ = [
     "BarometerNoiseConfig",
     "BodyDrag",
     "ClassicalControllerBackend",
+    "Disturbance",
+    "DisturbanceCfg",
     "Eskf",
     "EskfConfig",
     "Imu",
