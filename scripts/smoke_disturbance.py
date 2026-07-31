@@ -85,7 +85,45 @@ try:
     clean_ok = dv3 < 0.5 * want_dv
     ok = ok and clean_ok
     lines.append(f"clean restore |dv|={dv3:.3e} [{'OK' if clean_ok else 'FAIL'}]")
-    lines.append(f"[{'OK' if ok else 'FAIL'}] external-wrench physics")
+
+    # P1 effectiveness: rotor 0 at 50% -> collective deficit dvz ~= -0.125*g*dt
+    # and a roll/pitch couple ~= 0.5*T_hover*arm from the lost corner.
+    eff = torch.tensor([[0.5, 1.0, 1.0, 1.0]], device=args.device)
+    dsim.vehicle.set_rotor_effectiveness(eff)
+    v0e = s3.linear_velocity[0].clone()
+    w0e = s3.angular_velocity[0].clone()
+    s4 = dsim.step(hover)
+    dvz = float(s4.linear_velocity[0, 2] - v0e[2])
+    check("eff: dvz = -0.125*g*dt", dvz, -0.125 * 9.81 * dsim.dt, 0.25)
+    dw_mag = float((s4.angular_velocity[0, :2] - w0e[:2]).norm())
+    t_hover = dsim.mass * 9.81 / 4.0
+    arm = float(
+        torch.tensor([dsim.airframe.rotor_x[0], dsim.airframe.rotor_y[0]]).norm()
+    )
+    check(
+        "eff: |dw_xy| ~= 0.5*T*arm/I*dt",
+        dw_mag,
+        0.5 * t_hover * arm / float(dsim.inertia[:2].mean()) * dsim.dt,
+        0.5,
+    )
+    dsim.vehicle.set_rotor_effectiveness(None)
+
+    # P1 COM offset: shift the base COM +2 cm forward -> hover thrust becomes a
+    # sustained pitch torque ~= m*g*d (measured over one step against I_yy).
+    from isaacsitl.sim import offset_base_com
+
+    s5 = dsim.step(hover)  # settle one clean step post-eff
+    offset_base_com(dsim.robot, (0.02, 0.0, 0.0))
+    w0c = s5.angular_velocity[0].clone()
+    s6 = dsim.step(hover)
+    dwy = abs(float(s6.angular_velocity[0, 1] - w0c[1]))
+    check(
+        "com: |dwy| ~= m*g*d/Iyy*dt",
+        dwy,
+        dsim.mass * 9.81 * 0.02 / float(dsim.inertia[1]) * dsim.dt,
+        0.5,
+    )
+    lines.append(f"[{'OK' if ok else 'FAIL'}] external-wrench + P1 physics")
 except Exception as e:
     import traceback
 

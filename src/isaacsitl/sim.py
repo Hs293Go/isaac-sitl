@@ -45,6 +45,27 @@ def add_ground_and_lighting(prefix: str = "/World") -> None:
     key.func(f"{prefix}/KeyLight", key, orientation=tuple(q[0].tolist()))
 
 
+def offset_base_com(
+    robot: Articulation,
+    offset_flu: tuple[float, float, float],
+    body_name: str = "body",
+) -> None:
+    """Shift the base body's center of mass by `offset_flu` (body FLU [m]).
+
+    Real physics via the PhysX view (`set_coms`): every force's moment arm
+    moves, so collective thrust becomes a sustained torque disturbance — the
+    P1 lever-arm experiment (tau ~= m*g*d at hover). Call BEFORE flying;
+    mid-flight COM writes are not validated. Take any nominal inertia/mass
+    readback first — the point is that the controller believes the spec while
+    the plant carries the offset.
+    """
+    view = robot.root_physx_view
+    coms = view.get_coms()  # (N, num_bodies, 7): local COM pose [pos, quat]
+    bid = int(robot.find_bodies(body_name)[0][0])
+    coms[:, bid, :3] += torch.as_tensor(offset_flu, dtype=coms.dtype)
+    view.set_coms(coms, torch.arange(robot.num_instances))
+
+
 class ArticulationVehicle:
     """Batched vehicle over an Isaac Lab `Articulation` (rotor force-at-links)."""
 
@@ -85,6 +106,7 @@ class ArticulationVehicle:
         self._prev_vel = torch.zeros_like(articulation.data.root_lin_vel_w)
         self._ext_force_enu: torch.Tensor | None = None
         self._ext_torque_flu: torch.Tensor | None = None
+        self._rotor_eff: torch.Tensor | None = None
 
     def read_state(self) -> State:
         """Read the batched ENU-FLU `State` (PURE; call `commit_step` 1x/step).
@@ -130,6 +152,17 @@ class ArticulationVehicle:
         self._ext_force_enu = force_enu
         self._ext_torque_flu = torque_flu
 
+    def set_rotor_effectiveness(self, scale: torch.Tensor | None) -> None:
+        """Latch a PLANT-side per-rotor thrust scale (N, n_rotors); `None` clears.
+
+        The commanded thrusts are scaled at apply time — the commanding side
+        never sees it (matched effectiveness loss, the P1 degradation
+        experiment). Caveat: side-channel torques a consumer computes from the
+        COMMANDED thrusts (e.g. a yaw-couple recompute) will slightly overstate
+        a degraded rotor's drag couple — second-order (kappa * dT).
+        """
+        self._rotor_eff = scale
+
     def apply_actuation(self, actuation: Actuation) -> None:
         """Apply the rotor forces/wrench and any joint efforts/positions."""
         if actuation.rotor_thrust is not None and self._link_ids is not None:
@@ -137,6 +170,9 @@ class ArticulationVehicle:
             # collective) and the yaw couple on the base body, in one batch
             # set_forces_and_torques over [rotor links..., base body].
             t = actuation.rotor_thrust
+            if self._rotor_eff is not None:
+                # operand order avoids in-place: never mutate the caller's Actuation
+                t = self._rotor_eff * t  # plant-side degradation (P1)
             n = t.shape[-1]
             forces = t.new_zeros((*t.shape[:-1], len(self._link_ids), 3))
             forces[..., :n, 2] = t  # +z thrust at each rotor link (link-local frame)
@@ -233,6 +269,8 @@ class DroneSim:
         prim_path: str = "/World/Robot",
         mass_scale: float = 1.0,
         disturbance: DisturbanceCfg | None = None,
+        com_offset: tuple[float, float, float] | None = None,
+        rotor_effectiveness: tuple[float, ...] | None = None,
     ):
         """Build sim context + scene + vehicle from an airframe spec.
 
@@ -253,6 +291,10 @@ class DroneSim:
                 spec while the plant weighs the truth (`mass`).
             disturbance: optional deterministic external-wrench spec, applied
                 automatically each `step` (see `isaacsitl.disturbance`).
+            com_offset: optional base-body COM shift, body FLU [m] — collective
+                thrust becomes a sustained torque disturbance (P1 lever arm).
+            rotor_effectiveness: optional plant-side per-rotor thrust scale —
+                matched effectiveness loss the commander never sees (P1).
         """
         self.airframe = (
             load_airframe(airframe) if isinstance(airframe, str) else airframe
@@ -329,6 +371,14 @@ class DroneSim:
             rotor_xy=rotor_xy,
         )
         self.vehicle.commit_step()
+        if com_offset is not None:
+            offset_base_com(self.robot, com_offset)
+        if rotor_effectiveness is not None:
+            self.vehicle.set_rotor_effectiveness(
+                torch.as_tensor(
+                    rotor_effectiveness, dtype=torch.float32, device=device
+                ).broadcast_to(n, len(rotor_effectiveness))
+            )
         self._t = 0.0
         self._disturbance: Disturbance | None = None
         if disturbance is not None:
